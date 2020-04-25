@@ -1,153 +1,183 @@
 use crate::boolean_expression::*;
 use crate::token::*;
 use colored::*;
-use logos;
+use std::{collections::HashMap, iter::Peekable};
 
 lazy_static! {
     static ref ERROR_TAG: colored::ColoredString = "[ERROR]: ".red();
 }
 
 pub struct Parser<'source> {
-    lex: logos::Lexer<'source, Token>,
+    source: &'source str,
+    lex: Peekable<logos::SpannedIter<'source, Token>>,
+    ident_map: HashMap<&'source str, u32>,
+    next_ident_id: u32,
 }
 
 impl<'source> Parser<'source> {
     pub fn new(lex: logos::Lexer<'source, Token>) -> Self {
-        Self { lex }
+        Self {
+            source: lex.source(),
+            lex: lex.spanned().peekable(),
+            ident_map: HashMap::new(),
+            next_ident_id: 0,
+        }
     }
 
-    pub fn parse(&mut self) -> Option<BooleanExpression> {
+    pub fn parse(&mut self) -> Option<BooleanExpression<'source>> {
+        // This function checks if the expression is a valid boolean expression
+        // and converts it into reversed polish notation.
         let mut stack = Vec::new();
         let mut res = Vec::new();
-        let mut prev_token: Option<(Token, logos::Span)> = None;
-        while let Some(t) = self.lex.next() {
-            let t_span = self.lex.span();
+        let mut variables = Vec::new();
+        let mut prev_token: Option<Token> = None;
 
-            if t == Token::Error {
-                self.report_token_error(t_span, "Unknown token");
+        while let Some((token, span)) = self.lex.next() {
+            if token == Token::Error {
+                self.report_token_error(span, "Unknown token");
                 return None;
             }
 
-            match t {
+            match token {
                 Token::IDENT => {
-                    prev_token = Some((t, t_span));
-                    res.push(t)
+                    if let Some(next_token_span) =
+                        self.any_of_matches_next(&[Token::IDENT, Token::LPAREN, Token::NOT])
+                    {
+                        self.report_token_error(
+                            next_token_span,
+                            "Expected binary operator or right parenthesis.",
+                        );
+                        return None;
+                    }
+                    prev_token = Some(token);
+                    let ident_str = &self.source[span.start..span.end];
+                    if !self.ident_map.contains_key(ident_str) {
+                        self.ident_map.insert(ident_str, self.next_ident_id);
+                        variables.push(ident_str);
+                        self.next_ident_id += 1;
+                    }
+                    res.push(BooleanExpressionToken::IDENT(
+                        *self.ident_map.get(ident_str).unwrap(),
+                    ));
                 }
                 Token::LPAREN => {
-                    prev_token = Some((t, t_span.clone()));
-                    stack.push((t, t_span));
+                    if let Some(next_token_span) =
+                        self.any_of_matches_next(&[Token::AND, Token::OR, Token::XOR])
+                    {
+                        self.report_token_error(
+                            next_token_span,
+                            "Expected parenthesis, variable or unary operator",
+                        );
+                        return None;
+                    }
+                    prev_token = Some(token);
+
+                    stack.push((token, span));
                 }
                 Token::RPAREN => {
-                    prev_token = Some((t, t_span.clone()));
                     let mut seen_lparen = false;
-                    while let Some((st, _)) = stack.pop() {
-                        if st == Token::LPAREN {
+                    while let Some((top, _)) = stack.pop() {
+                        if top == Token::LPAREN {
                             seen_lparen = true;
                             break;
                         }
-                        res.push(st);
+                        res.push(BooleanExpressionToken::OPERATOR(top));
                     }
                     if !seen_lparen {
-                        self.report_token_error(t_span, "Unmatched opening parenthesis");
+                        self.report_token_error(span, "Unmatched left parenthesis");
                         return None;
                     }
+                    if let Some(next_token_span) =
+                        self.any_of_matches_next(&[Token::IDENT, Token::NOT, Token::LPAREN])
+                    {
+                        self.report_token_error(
+                            next_token_span,
+                            "Expected binary operator or right parenthesis",
+                        );
+                        return None;
+                    }
+                    prev_token = Some(token);
                 }
                 _ => {
                     // These are all the operators
                     while let Some((top, _)) = stack.last() {
-                        if t == Token::NOT {
+                        if token == Token::NOT {
+                            // Special case for unary operators such as NOT.
+                            // We want to keep them in the stack
                             break;
                         }
-                        if *top <= t {
-                            res.push(*top);
+                        if *top <= token {
+                            res.push(BooleanExpressionToken::OPERATOR(*top));
                             stack.pop();
                         } else {
                             break;
                         }
                     }
-                    stack.push((t, t_span.clone()));
-                    if !self.check_operator_context(prev_token, t, t_span.clone()) {
+                    stack.push((token, span.clone()));
+
+                    if prev_token.is_none() && token.is_binary_operator() {
+                        self.report_token_error(
+                            span,
+                            "Missing left hand side of binary expression",
+                        );
                         return None;
                     }
-                    prev_token = Some((t, t_span));
+
+                    if let Some(next_token_span) = self.any_of_matches_next(&[
+                        Token::AND,
+                        Token::OR,
+                        Token::XOR,
+                        Token::RPAREN,
+                    ]) {
+                        self.report_token_error(
+                            next_token_span,
+                            "Expected variable, left parenthesis or unary operator",
+                        );
+                        return None;
+                    } else if self.lex.peek().is_none() {
+                        self.report_token_error(
+                            span,
+                            "Missing right hand side of binary expression",
+                        );
+                        return None;
+                    }
+
+                    prev_token = Some(token);
                 }
             }
         }
 
-        while let Some((t, t_span)) = stack.pop() {
-            if t == Token::LPAREN {
-                self.report_token_error(t_span, "Unclosed right parenthesis");
+        while let Some((token, span)) = stack.pop() {
+            if token == Token::LPAREN {
+                self.report_token_error(span, "Unmatched right parenthesis");
                 return None;
             }
-            res.push(t);
+            res.push(BooleanExpressionToken::OPERATOR(token));
         }
 
-        Some(BooleanExpression::new(res))
+        Some(BooleanExpression::new(res, variables))
     }
 
-    fn check_operator_context(
-        &self,
-        prev_token: Option<(Token, logos::Span)>,
-        op: Token,
-        op_span: logos::Span,
-    ) -> bool {
-        let mut cloned_lex = self.lex.clone();
-        let next_token = cloned_lex.next();
-        let next_token_span = cloned_lex.span();
-
-        match next_token {
-            Some(next_token) => {
-                if next_token == Token::Error {
-                    self.report_token_error(next_token_span, "Unknown token");
-                    return false;
+    fn any_of_matches_next(&mut self, tokens: &[Token]) -> Option<logos::Span> {
+        if let Some((next, span)) = self.lex.peek().map(|(t, s)| (*t, s.clone())) {
+            for token in tokens {
+                if *token == next {
+                    return Some(span);
                 }
-
-                if next_token == Token::RPAREN {
-                    self.report_token_error(next_token_span, "Invalid operand");
-                    return false;
-                }
-
-                if next_token != Token::NOT
-                    && next_token != Token::IDENT
-                    && next_token != Token::LPAREN
-                {
-                    self.report_token_error(next_token_span, "Invalid operator");
-                    return false;
-                }
-
-                if op != Token::NOT {
-                    if prev_token.is_none() {
-                        self.report_token_error(op_span, "Missing left hand side operand");
-                        return false;
-                    }
-                    let prev_token = prev_token.unwrap();
-
-                    if prev_token.0 != Token::IDENT && prev_token.0 != Token::RPAREN {
-                        self.report_token_error(prev_token.1, "Invalid operand");
-                        return false;
-                    }
-                }
-
-                return true;
             }
-            None => {
-                self.report_token_error(
-                    op_span,
-                    "Right hand side operand of expression is missing",
-                );
-                return false;
-            }
+            None
+        } else {
+            None
         }
     }
 
     fn report_token_error(&self, token_span: logos::Span, msg: &str) {
-        let source = self.lex.source();
         eprintln!(
             "{}{}{}{}",
             *ERROR_TAG,
-            &source[..token_span.start],
-            &source[token_span.start..token_span.end].red(),
-            &source[token_span.end..]
+            &self.source[..token_span.start],
+            &self.source[token_span.start..token_span.end].red(),
+            &self.source[token_span.end..]
         );
         eprintln!(
             "{}{}",
@@ -171,7 +201,16 @@ mod tests {
     fn test_unary_operator_not() {
         let exp = Parser::new(Token::lexer("!A")).parse();
         assert!(exp.is_some());
-        assert_eq!(exp.unwrap().exp, vec![Token::IDENT, Token::NOT]);
+        assert_eq!(
+            exp.unwrap(),
+            BooleanExpression::new(
+                vec![
+                    BooleanExpressionToken::IDENT(0),
+                    BooleanExpressionToken::OPERATOR(Token::NOT)
+                ],
+                vec!["A"]
+            )
+        );
     }
 
     #[test]
@@ -179,8 +218,15 @@ mod tests {
         let exp = Parser::new(Token::lexer("A && B")).parse();
         assert!(exp.is_some());
         assert_eq!(
-            exp.unwrap().exp,
-            vec![Token::IDENT, Token::IDENT, Token::AND]
+            exp.unwrap(),
+            BooleanExpression::new(
+                vec![
+                    BooleanExpressionToken::IDENT(0),
+                    BooleanExpressionToken::IDENT(1),
+                    BooleanExpressionToken::OPERATOR(Token::AND)
+                ],
+                vec!["A", "B"]
+            )
         );
     }
 
@@ -189,8 +235,15 @@ mod tests {
         let exp = Parser::new(Token::lexer("A || B")).parse();
         assert!(exp.is_some());
         assert_eq!(
-            exp.unwrap().exp,
-            vec![Token::IDENT, Token::IDENT, Token::OR]
+            exp.unwrap(),
+            BooleanExpression::new(
+                vec![
+                    BooleanExpressionToken::IDENT(0),
+                    BooleanExpressionToken::IDENT(1),
+                    BooleanExpressionToken::OPERATOR(Token::OR)
+                ],
+                vec!["A", "B"]
+            )
         );
     }
 
@@ -199,18 +252,72 @@ mod tests {
         let exp = Parser::new(Token::lexer("A ^ B")).parse();
         assert!(exp.is_some());
         assert_eq!(
-            exp.unwrap().exp,
-            vec![Token::IDENT, Token::IDENT, Token::XOR]
+            exp.unwrap(),
+            BooleanExpression::new(
+                vec![
+                    BooleanExpressionToken::IDENT(0),
+                    BooleanExpressionToken::IDENT(1),
+                    BooleanExpressionToken::OPERATOR(Token::XOR)
+                ],
+                vec!["A", "B"]
+            )
         );
     }
 
     #[test]
     fn test_parenthesis_erasure() {
-        let exp = Parser::new(Token::lexer("(A) && (B)")).parse();
+        let exp = Parser::new(Token::lexer("((A) && (B))")).parse();
         assert!(exp.is_some());
         assert_eq!(
-            exp.unwrap().exp,
-            vec![Token::IDENT, Token::IDENT, Token::AND]
+            exp.unwrap(),
+            BooleanExpression::new(
+                vec![
+                    BooleanExpressionToken::IDENT(0),
+                    BooleanExpressionToken::IDENT(1),
+                    BooleanExpressionToken::OPERATOR(Token::AND)
+                ],
+                vec!["A", "B"]
+            )
+        );
+    }
+
+    #[test]
+    fn test_operator_precedence() {
+        let exp = Parser::new(Token::lexer("A && !B || C")).parse();
+        assert!(exp.is_some());
+        assert_eq!(
+            exp.unwrap(),
+            BooleanExpression::new(
+                vec![
+                    BooleanExpressionToken::IDENT(0),
+                    BooleanExpressionToken::IDENT(1),
+                    BooleanExpressionToken::OPERATOR(Token::NOT),
+                    BooleanExpressionToken::OPERATOR(Token::AND),
+                    BooleanExpressionToken::IDENT(2),
+                    BooleanExpressionToken::OPERATOR(Token::OR)
+                ],
+                vec!["A", "B", "C"]
+            )
+        );
+    }
+
+    #[test]
+    fn test_same_identifier() {
+        let exp = Parser::new(Token::lexer("A && B || !A")).parse();
+        assert!(exp.is_some());
+        assert_eq!(
+            exp.unwrap(),
+            BooleanExpression::new(
+                vec![
+                    BooleanExpressionToken::IDENT(0),
+                    BooleanExpressionToken::IDENT(1),
+                    BooleanExpressionToken::OPERATOR(Token::AND),
+                    BooleanExpressionToken::IDENT(0),
+                    BooleanExpressionToken::OPERATOR(Token::NOT),
+                    BooleanExpressionToken::OPERATOR(Token::OR),
+                ],
+                vec!["A", "B"]
+            )
         );
     }
 }
