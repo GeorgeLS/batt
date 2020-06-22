@@ -8,6 +8,9 @@ repository = "https://github.com/GeorgeLS/batt"
 license = "GPL-2.0"
 exclude = ["build/**/*.o", "doc/**/*.html"]
 include = ["src/**/*", "Cargo.toml"]
+description = """
+Command line program to input boolean expressions and print their truth tables.
+"""
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
